@@ -1,0 +1,5 @@
+# GitHub Linguist has no Pine Script language, so left alone this repo is
+# reported as "Python 100%" on the strength of two small verification scripts,
+# which misrepresents what it actually contains. Better no label than a wrong one.
+*.pine linguist-detectable=false
+*.py   linguist-detectable=false
