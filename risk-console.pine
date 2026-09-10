@@ -1,0 +1,247 @@
+// This Pine Script(R) code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// (c) dvdvillasaiz
+//@version=6
+// ===============================================================================
+//  RISK CONSOLE — ATR Position Sizing & Cost Impact
+//  Open source. Free to use, study and modify.
+//
+//  WHY THIS EXISTS
+//  Most position-size calculators tell you how many units to buy and stop there.
+//  They ignore that commission, slippage and funding are paid out of the same
+//  pocket as your risk. A 2R winner is not a 2R winner once the round trip is
+//  paid for. This tool prices that in and shows the win rate you actually need.
+//
+//  Nothing here is a signal or a recommendation. It is arithmetic on inputs you
+//  supply. Costs are modelled, not fetched — set them to match your broker.
+// ===============================================================================
+
+indicator("Risk Console — ATR Position Sizing & Cost Impact", "Risk Console",
+     overlay = true, max_lines_count = 20, max_labels_count = 20)
+
+// ------------------------------------------------------------- 1 · Account ----
+gAcc = "1 · Account & risk"
+accountSize = input.float(10000.0, "Account size", minval = 0.0, step = 100.0, group = gAcc,
+     tooltip = "Total capital in your account currency.")
+riskPct = input.float(1.0, "Risk per trade (%)", minval = 0.01, maxval = 100.0, step = 0.1, group = gAcc,
+     tooltip = "Share of the account you accept losing if the stop is hit. This is your 1R.")
+ccy = input.string("€", "Currency symbol", group = gAcc)
+
+// --------------------------------------------------------------- 2 · Trade ----
+gDir = "2 · Trade"
+dirIn = input.string("Long", "Direction", options = ["Long", "Short"], group = gDir)
+useManualEntry = input.bool(false, "Use manual entry price", group = gDir,
+     tooltip = "Off = the current close is used as the entry.")
+manualEntry = input.float(0.0, "Manual entry price", minval = 0.0, group = gDir)
+
+// ---------------------------------------------------------------- 3 · Stop ----
+gStop = "3 · Stop distance"
+stopMode = input.string("ATR multiple", "Method",
+     options = ["ATR multiple", "Percent of price", "Manual stop price"], group = gStop)
+atrLen = input.int(14, "ATR length", minval = 1, group = gStop)
+atrMult = input.float(2.0, "ATR multiple", minval = 0.1, step = 0.1, group = gStop,
+     tooltip = "Volatility-scaled stop. 1.5-3.0 is the usual working range.")
+stopPct = input.float(1.5, "Stop distance (%)", minval = 0.01, step = 0.1, group = gStop)
+manualStop = input.float(0.0, "Manual stop price", minval = 0.0, group = gStop)
+
+// --------------------------------------------------------------- 4 · Costs ----
+gCost = "4 · Real trading costs"
+commPct = input.float(0.05, "Commission per side (%)", minval = 0.0, step = 0.01, group = gCost,
+     tooltip = "Taker fee for ONE side. The round trip is charged twice.")
+slipTicks = input.int(2, "Slippage per side (ticks)", minval = 0, group = gCost,
+     tooltip = "How far from your intended price you realistically get filled, in ticks. Widen on illiquid symbols and on news.")
+fundingPct = input.float(0.0, "Funding / carry over the hold (%)", step = 0.001, group = gCost,
+     tooltip = "Total financing cost across the expected holding period. Leave at 0 for spot.")
+
+// -------------------------------------------------------------- 5 · Targets ---
+gTgt = "5 · Targets"
+r1 = input.float(1.0, "Target 1 (R)", minval = 0.1, step = 0.1, group = gTgt)
+r2 = input.float(2.0, "Target 2 (R)", minval = 0.1, step = 0.1, group = gTgt)
+r3 = input.float(3.0, "Target 3 (R)", minval = 0.1, step = 0.1, group = gTgt)
+
+// -------------------------------------------------------------- 6 · Display ---
+gViz = "6 · Display"
+showLevels = input.bool(true, "Draw levels on chart", group = gViz)
+tblPosIn = input.string("Top right", "Table position",
+     options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = gViz)
+txtSizeIn = input.string("Small", "Text size", options = ["Tiny", "Small", "Normal", "Large"], group = gViz)
+
+// ============================================================== CALCULATIONS ==
+isLong = dirIn == "Long"
+entry  = useManualEntry and manualEntry > 0.0 ? manualEntry : close
+atrVal = ta.atr(atrLen)
+
+rawStopDist = stopMode == "ATR multiple"     ? atrVal * atrMult :
+              stopMode == "Percent of price" ? entry * stopPct / 100.0 :
+              manualStop > 0.0               ? math.abs(entry - manualStop) : 0.0
+
+validStop  = not na(rawStopDist) and rawStopDist > 0.0
+stopDist   = validStop ? rawStopDist : 0.0
+stopPrice  = isLong ? entry - stopDist : entry + stopDist
+stopDistPc = entry > 0.0 ? stopDist / entry * 100.0 : 0.0
+
+riskAmount = accountSize * riskPct / 100.0
+posSize    = validStop ? riskAmount / stopDist : 0.0
+notional   = posSize * entry
+
+// Round-trip costs: commission and slippage are paid on entry AND on exit.
+commCost  = notional * commPct / 100.0 * 2.0
+slipCost  = posSize * slipTicks * syminfo.mintick * 2.0
+fundCost  = notional * fundingPct / 100.0
+totalCost = commCost + slipCost + fundCost
+
+// Cost expressed in R units — the number that actually matters.
+costInR = riskAmount > 0.0 ? totalCost / riskAmount : 0.0
+bePct   = notional   > 0.0 ? totalCost / notional * 100.0 : 0.0
+
+tgtPrice(rMult) => isLong ? entry + stopDist * rMult : entry - stopDist * rMult
+netR(rMult)     => rMult - costInR
+
+// Break-even win rate with costs included.
+//   E = p·(R − c) − (1 − p)·(1 + c) = 0   →   p = (1 + c) / (R + 1)
+// With c = 0 this collapses to the textbook p = 1/(R+1), as it should.
+winRateReq(rMult) => (1.0 + costInR) / (rMult + 1.0) * 100.0
+
+// =================================================================== STYLE ===
+// Theme-aware palette. The chart background's luminance tells us whether the
+// user is on a light or a dark theme; the panel colours are then explicit and
+// nearly opaque. Deriving the background straight from chart.bg_color left the
+// panel translucent and the candles showed through it.
+bgLum        = color.r(chart.bg_color) * 0.299 + color.g(chart.bg_color) * 0.587 + color.b(chart.bg_color) * 0.114
+isLightTheme = bgLum > 128.0
+colBg    = isLightTheme ? color.new(#ffffff, 4)  : color.new(#131722, 4)
+colHdrBg = isLightTheme ? color.new(#1f6feb, 86) : color.new(#1f6feb, 78)
+colSecBg = isLightTheme ? color.new(#000000, 94) : color.new(#ffffff, 92)
+colText  = isLightTheme ? #131722 : #d1d4dc
+colMuted = isLightTheme ? #6a6d78 : #868993
+colLong  = #26a69a
+colShort = #ef5350
+colWarn  = #f0a202
+colBad   = #ef5350
+colGood  = #26a69a
+colDir   = isLong ? colLong : colShort
+
+// Cost drag verdict: how much of your 1R is eaten before the trade even works.
+dragCol = costInR >= 0.30 ? colBad : costInR >= 0.15 ? colWarn : colGood
+dragTxt = costInR >= 0.30 ? "heavy" : costInR >= 0.15 ? "notable" : "acceptable"
+
+tablePos = tblPosIn == "Top right"    ? position.top_right    :
+           tblPosIn == "Top left"     ? position.top_left     :
+           tblPosIn == "Bottom right" ? position.bottom_right :
+           tblPosIn == "Bottom left"  ? position.bottom_left  : position.middle_right
+
+tSize = txtSizeIn == "Tiny"  ? size.tiny  :
+         txtSizeIn == "Small" ? size.small :
+         txtSizeIn == "Large" ? size.large : size.normal
+
+fPrice(x) => str.tostring(x, format.mintick)
+fMoney(x) => ccy + " " + str.tostring(x, "#,###.##")
+fPct(x)   => str.tostring(x, "#.##") + " %"
+
+// ================================================================= TABLE =====
+// Design note: table.merge_cells is deliberately NOT used. TradingView raises an
+// error when you merge cells that are already merged, and barstate.islast is true
+// on every realtime tick — a repeated merge would break the script live. All four
+// columns are written every time instead; successive table.cell calls simply
+// overwrite, which is documented and safe.
+var table t = table.new(tablePos, 4, 21, bgcolor = colBg,
+     frame_color = color.new(colMuted, 55), frame_width = 1,
+     border_color = color.new(colMuted, 80), border_width = 1)
+
+// Label + value row. Columns 2 and 3 are intentionally left blank.
+kv(r, lbl, val, valCol) =>
+    table.cell(t, 0, r, lbl, text_halign = text.align_left,  text_color = colMuted, text_size = tSize, bgcolor = colBg)
+    table.cell(t, 1, r, val, text_halign = text.align_right, text_color = valCol,   text_size = tSize, bgcolor = colBg)
+    table.cell(t, 2, r, "", text_size = tSize, bgcolor = colBg)
+    table.cell(t, 3, r, "", text_size = tSize, bgcolor = colBg)
+
+// Section band. The background is painted across all four columns so it spans
+// the full width without needing a merge.
+section(r, txt, bg) =>
+    table.cell(t, 0, r, txt, text_halign = text.align_left, text_color = colMuted,
+         text_size = tSize, bgcolor = bg)
+    table.cell(t, 1, r, "", bgcolor = bg, text_size = tSize)
+    table.cell(t, 2, r, "", bgcolor = bg, text_size = tSize)
+    table.cell(t, 3, r, "", bgcolor = bg, text_size = tSize)
+
+// Target row: price, net R after costs, and the win rate required at that target.
+tgtRow(r, idx, rm) =>
+    nr = netR(rm)
+    table.cell(t, 0, r, "T" + str.tostring(idx) + "  " + str.tostring(rm, "#.#") + "R",
+         text_halign = text.align_left,  text_color = colText, text_size = tSize, bgcolor = colBg)
+    table.cell(t, 1, r, validStop ? fPrice(tgtPrice(rm)) : "—",
+         text_halign = text.align_right, text_color = colText, text_size = tSize, bgcolor = colBg)
+    table.cell(t, 2, r, str.tostring(nr, "#.##") + "R",
+         text_halign = text.align_right, text_color = nr > 0.0 ? colGood : colBad, text_size = tSize, bgcolor = colBg)
+    table.cell(t, 3, r, fPct(winRateReq(rm)),
+         text_halign = text.align_right, text_color = colText, text_size = tSize, bgcolor = colBg)
+
+if barstate.islast
+    section(0, "RISK CONSOLE  ·  " + (isLong ? "LONG" : "SHORT"), colHdrBg)
+
+    section(1, "SETUP", colSecBg)
+    kv(2, "Entry",            fPrice(entry),                                                        colText)
+    kv(3, "Stop",             validStop ? fPrice(stopPrice) : "set a stop",                     validStop ? colDir : colBad)
+    kv(4, "Stop distance",    validStop ? fPrice(stopDist) + "   (" + fPct(stopDistPc) + ")" : "—", colText)
+    kv(5, "Position size",    str.tostring(posSize, "#,###.########") + " units",                   colText)
+    kv(6, "Notional",         fMoney(notional),                                                     colText)
+    kv(7, "Risk  (1R)",       fMoney(riskAmount),                                                   colDir)
+
+    section(8, "COSTS · round trip", colSecBg)
+    kv(9,  "Commission",      fMoney(commCost),  colText)
+    kv(10, "Slippage",        fMoney(slipCost),  colText)
+    kv(11, "Funding",         fMoney(fundCost),  colText)
+    kv(12, "Total cost",      fMoney(totalCost), colText)
+    kv(13, "Cost vs 1R",      fPct(costInR * 100.0) + "   (" + dragTxt + ")", dragCol)
+    kv(14, "Break-even",      fPct(bePct), colText)
+
+    section(15, "AFTER COSTS", colSecBg)
+    table.cell(t, 0, 16, "Target",   text_halign = text.align_left,  text_color = colMuted, text_size = tSize, bgcolor = colBg)
+    table.cell(t, 1, 16, "Price",    text_halign = text.align_right, text_color = colMuted, text_size = tSize, bgcolor = colBg)
+    table.cell(t, 2, 16, "Net R",    text_halign = text.align_right, text_color = colMuted, text_size = tSize, bgcolor = colBg)
+    table.cell(t, 3, 16, "Win% req", text_halign = text.align_right, text_color = colMuted, text_size = tSize, bgcolor = colBg)
+
+    tgtRow(17, 1, r1)
+    tgtRow(18, 2, r2)
+    tgtRow(19, 3, r3)
+
+    // Written directly rather than through section() so it can use tiny text:
+    // this row used to be the widest cell in the table and stretched it.
+    table.cell(t, 0, 20, "modelled costs - match your broker",
+         text_halign = text.align_left, text_color = colMuted, text_size = size.tiny, bgcolor = colBg)
+    table.cell(t, 1, 20, "", text_size = size.tiny, bgcolor = colBg)
+    table.cell(t, 2, 20, "", text_size = size.tiny, bgcolor = colBg)
+    table.cell(t, 3, 20, "", text_size = size.tiny, bgcolor = colBg)
+
+// ================================================================= LEVELS ====
+var line lnEntry = na
+var line lnStop  = na
+var line lnT1    = na
+var line lnT2    = na
+var line lnT3    = na
+var label lbEntry = na
+var label lbStop  = na
+
+if barstate.islast
+    line.delete(lnEntry)
+    line.delete(lnStop)
+    line.delete(lnT1)
+    line.delete(lnT2)
+    line.delete(lnT3)
+    label.delete(lbEntry)
+    label.delete(lbStop)
+
+    if showLevels and validStop
+        x1 = bar_index
+        x2 = bar_index + 15
+        lnEntry := line.new(x1, entry,        x2, entry,        color = color.new(colText, 20), width = 2)
+        lnStop  := line.new(x1, stopPrice,    x2, stopPrice,    color = colBad, width = 1, style = line.style_dashed)
+        lnT1    := line.new(x1, tgtPrice(r1), x2, tgtPrice(r1), color = color.new(colGood, 55), width = 1, style = line.style_dotted)
+        lnT2    := line.new(x1, tgtPrice(r2), x2, tgtPrice(r2), color = color.new(colGood, 40), width = 1, style = line.style_dotted)
+        lnT3    := line.new(x1, tgtPrice(r3), x2, tgtPrice(r3), color = color.new(colGood, 25), width = 1, style = line.style_dotted)
+
+        lbEntry := label.new(x2, entry, "Entry  " + fPrice(entry),
+             style = label.style_label_left, color = color.new(colBg, 0),
+             textcolor = colText, size = size.small)
+        lbStop  := label.new(x2, stopPrice, "Stop  " + fPrice(stopPrice) + "   -1R " + fMoney(riskAmount),
+             style = label.style_label_left, color = color.new(colBad, 20),
+             textcolor = color.white, size = size.small)
